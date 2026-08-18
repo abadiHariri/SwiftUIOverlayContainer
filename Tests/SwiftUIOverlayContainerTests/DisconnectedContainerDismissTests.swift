@@ -320,6 +320,67 @@ class DisconnectedContainerDismissTests: XCTestCase {
         XCTAssertNil(manager.preservedQueueStates[containerName])
     }
 
+    // MARK: - Orphaned handlers (same-name registration replaced the publisher)
+
+    /// The device-log scenario: handler A holds and renders the view, then a same-name container
+    /// registers and `checkForExist` replaces the publisher. Every dismiss is now delivered to the
+    /// empty replacement while A — which still looks subscribed — keeps the view on screen forever.
+    func testDismissAllReachesOrphanedHandlerAfterSameNameReplacement() throws {
+        // given handler A holds a view and is then orphaned by handler B registering the same name
+        handler.connect()
+        handler.mainQueue.push(makeView(), with: nil)
+        let replacement = makeHandler(queueType: .multiple)
+        replacement.connect()
+        XCTAssertNotNil(handler.cancellable, "the orphan still holds its dead subscription")
+
+        // when
+        manager.dismissAllView(in: [containerName], animated: false)
+        drainMainQueue()
+
+        // then both the orphan and the replacement are empty
+        XCTAssertEqual(handler.mainQueue.count, 0, "the orphaned handler's view must be dismissed")
+        XCTAssertEqual(replacement.mainQueue.count, 0)
+    }
+
+    func testDismissViewReachesOrphanedHandlerAfterSameNameReplacement() throws {
+        // given
+        handler.connect()
+        let identifiableView = makeView()
+        handler.mainQueue.push(identifiableView, with: nil)
+        let replacement = makeHandler(queueType: .multiple)
+        replacement.connect()
+
+        // when
+        manager.dismiss(view: identifiableView.id, in: containerName, animated: false)
+        drainMainQueue()
+
+        // then
+        XCTAssertEqual(handler.mainQueue.count, 0)
+    }
+
+    /// The replacement handler is subscribed to the current publisher, so it must be reached by
+    /// the publisher send alone — never a second time by the direct delivery.
+    func testReplacementHandlerIsReachedExactlyOnce() throws {
+        // given an orphan and a replacement that both hold views
+        handler.connect()
+        handler.mainQueue.push(makeView(), with: nil)
+        handler.mainQueue.push(makeView(), with: nil)
+        let replacement = makeHandler(queueType: .multiple)
+        replacement.connect()
+        replacement.mainQueue.push(makeView(), with: nil)
+        replacement.mainQueue.push(makeView(), with: nil)
+
+        // when the topmost view of the container is dismissed
+        manager.dismissTopmostView(in: [containerName], animated: false)
+        drainMainQueue()
+        drainMainQueue()
+
+        // then each handler lost exactly one view: the replacement via the publisher, the orphan
+        // via the direct delivery — never two from either
+        XCTAssertEqual(replacement.mainQueue.count, 1)
+        XCTAssertEqual(handler.mainQueue.count, 1)
+    }
+
     /// A handler that has gone must not keep the manager from serving its replacement.
     func testDeallocatedHandlerIsPrunedFromTheRegistry() throws {
         // given

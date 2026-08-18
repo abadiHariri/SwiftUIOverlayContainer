@@ -140,25 +140,29 @@ public final class ContainerManager: ContainerManagerLogger {
         case topmost
     }
 
-    /// Complete a dismiss for the parts of a container the publisher cannot reach: the queue state
-    /// preserved for a container that is currently torn down, and any live handler that is not
-    /// subscribed.
+    /// Complete a dismiss for the parts of a container the publisher send cannot reach: the queue
+    /// state preserved for a container that is currently torn down, and every live handler that is
+    /// not subscribed to the publisher the send went to.
     ///
-    /// Whether the container was registered is sampled now rather than when the hop runs. A
-    /// container that reconnects in between would otherwise look connected and be skipped, even
-    /// though nothing was ever sent to it. When it was registered the subscribed handlers already
-    /// received the action through the publisher and only the unsubscribed ones are covered here;
-    /// when it was not, nothing was sent at all, so every live handler is. Each handler is reached
-    /// exactly once either way, which is what a non-idempotent action such as `dismissTopmostView`
-    /// requires.
+    /// The current publisher's identity is sampled now rather than when the hop runs. A container
+    /// that reconnects in between would otherwise look reached and be skipped, even though nothing
+    /// was ever sent to it. Handlers are matched by the identity of the publisher they subscribed
+    /// to, NOT by whether they hold a subscription: a same-name container registering replaces the
+    /// publisher (`checkForExist`) and leaves the previous handler subscribed to a dead share —
+    /// still holding and rendering its queue, unreachable by any send, yet looking "connected".
+    /// Matching on identity delivers to that orphan and still skips the handler the send did
+    /// reach, so every handler is reached exactly once, which is what a non-idempotent action such
+    /// as `dismissTopmostView` requires.
     ///
     /// Everything touching `queueHandlers` and `preservedQueueStates` runs inside the hop, so both
     /// are only ever mutated on the main queue, matching `connect` and `disconnect`.
     func completeDismiss(_ scope: DismissScope, in container: String, animated flag: Bool) {
-        completeDismiss(scope, in: container, animated: flag, wasRegistered: publishers[container] != nil)
+        completeDismiss(scope, in: container, animated: flag, sentTo: publishers[container])
     }
 
-    func completeDismiss(_ scope: DismissScope, in container: String, animated flag: Bool, wasRegistered: Bool) {
+    /// `sentPublisher` is captured strongly so the identity comparison inside the hop is always
+    /// between live objects — a deallocated share's address can be reused by its replacement.
+    func completeDismiss(_ scope: DismissScope, in container: String, animated flag: Bool, sentTo sentPublisher: ContainerViewPublisher?) {
         DispatchQueue.main.async { @MainActor [weak self] in
             guard let self = self else { return }
 
@@ -168,8 +172,10 @@ public final class ContainerManager: ContainerManagerLogger {
                 self.discardPreserved(scope, for: container)
             }
 
-            let unreached = self.liveQueueHandlers(for: container)
-                .filter { !wasRegistered || $0.cancellable == nil }
+            let unreached = self.liveQueueHandlers(for: container).filter { handler in
+                guard let sentPublisher = sentPublisher else { return true }
+                return handler.subscribedPublisher !== sentPublisher
+            }
             guard !unreached.isEmpty else { return }
 
             self.sendMessage(
@@ -360,17 +366,17 @@ extension ContainerManager: ContainerViewManagementForEnvironment {
         let registered = publishers.filter { !excludeContainers.contains($0.key) }
         for (container, publisher) in registered {
             publisher.upstream.send(onlyShowing ? .dismissShowing(flag) : .dismissAll(flag))
-            completeDismiss(scope, in: container, animated: flag, wasRegistered: true)
+            completeDismiss(scope, in: container, animated: flag, sentTo: publisher)
         }
 
         // The containers that are torn down are sampled now rather than when the hop runs, so a
         // container that appears after this call is not dismissed by a request that predates it.
-        // Nothing was sent to them, so `wasRegistered: false` holds even if one reconnects first.
+        // Nothing was sent to them, so `sentTo: nil` holds even if one reconnects first.
         let torndown = knownContainers
             .subtracting(excludeContainers)
             .subtracting(registered.keys)
         for container in torndown {
-            completeDismiss(scope, in: container, animated: flag, wasRegistered: false)
+            completeDismiss(scope, in: container, animated: flag, sentTo: nil)
         }
     }
 

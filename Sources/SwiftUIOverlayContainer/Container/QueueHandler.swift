@@ -95,9 +95,20 @@ final class ContainerQueueHandler: ObservableObject {
         self.queueControlOperator = queueControlOperator
     }
 
+    /// The publisher this handler is subscribed to; nil when disconnected.
+    ///
+    /// `checkForExist` replaces a container's publisher whenever a same-name container registers,
+    /// leaving the previous handler subscribed to a share the manager no longer sends to. Such an
+    /// orphan still holds and renders its queue, so the manager compares this against the current
+    /// publisher to know which handlers a publisher send did NOT reach. Held strongly on purpose:
+    /// identity comparison against a deallocated share is meaningless, because its address can be
+    /// reused by the replacement.
+    var subscribedPublisher: ContainerViewPublisher?
+
     /// Unregister the container and optionally keep queued views for inactive scene transitions.
     func disconnect(preservingQueue: Bool = false) {
         cancellable = nil
+        subscribedPublisher = nil
         if preservingQueue {
             manager.preserveQueueState(
                 PreservedContainerQueueState(mainQueue: mainQueue, tempQueue: tempQueue),
@@ -115,14 +126,16 @@ final class ContainerQueueHandler: ObservableObject {
 
     /// Register the container in the container manager. This method will be called when  the container appear ( not in container view init ).
     func connect() {
+        let sharedPublisher = manager.registerContainer(for: container)
+        subscribedPublisher = sharedPublisher
         let publisher: AnyPublisher<OverlayContainerAction, Never>
         switch queueControlOperator {
         case let .debounce(seconds: seconds):
-            publisher = manager.registerContainer(for: container)
+            publisher = sharedPublisher
                 .debounce(for: .seconds(seconds), scheduler: DispatchQueue.main)
                 .eraseToAnyPublisher()
         case .none:
-            publisher = manager.registerContainer(for: container).eraseToAnyPublisher()
+            publisher = sharedPublisher.eraseToAnyPublisher()
         }
         cancellable = publisher
             .receive(on: DispatchQueue.main)
