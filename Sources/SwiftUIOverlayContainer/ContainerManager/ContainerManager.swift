@@ -172,17 +172,22 @@ public final class ContainerManager: ContainerManagerLogger {
                 self.discardPreserved(scope, for: container)
             }
 
-            let unreached = self.liveQueueHandlers(for: container).filter { handler in
+            let live = self.liveQueueHandlers(for: container)
+            let unreached = live.filter { handler in
                 guard let sentPublisher = sentPublisher else { return true }
                 return handler.subscribedPublisher !== sentPublisher
             }
-            guard !unreached.isEmpty else { return }
 
             self.sendMessage(
                 type: .info,
-                message: "dismiss delivered directly to \(unreached.count) unreached handler(s) of `\(container)`",
+                message: "completeDismiss \(scope) on `\(container)`: \(live.count) live handler(s) "
+                    + "[\(live.map { "\($0.handlerTag)/main:\($0.mainQueue.count)/sub:\($0.subscribedPublisher == nil ? "nil" : "yes")" }.joined(separator: ", "))], "
+                    + "sentTo \(sentPublisher == nil ? "nobody" : "current publisher"), "
+                    + "delivering directly to \(unreached.count)",
                 debugLevel: 2
             )
+
+            guard !unreached.isEmpty else { return }
 
             for handler in unreached {
                 switch scope {
