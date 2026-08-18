@@ -190,8 +190,8 @@ extension ContainerQueueHandler {
             return
         }
 
-        // setup animation
-        var animation = Animation.disable
+        // setup animation. nil means the removal must not be animated at all.
+        var animation: Animation?
         if flag {
             animation = Animation.merge(
                 containerAnimation: self.animation,
@@ -204,7 +204,7 @@ extension ContainerQueueHandler {
         case .main:
             remove(view: id, from: .main, animation: animation)
         case .temporary:
-            remove(view: id, from: .temporary, animation: .disable)
+            remove(view: id, from: .temporary, animation: nil)
         }
 
         // Set bind value (isPresented) to false
@@ -252,14 +252,14 @@ extension ContainerQueueHandler {
         identifiableView.timeStamp = Date()
         switch queue {
         case .main:
-            var animation: Animation = .disable
+            var animation: Animation?
             if flag {
                 animation = Animation.merge(
                     containerAnimation: self.animation,
                     viewAnimation: identifiableView.configuration.animation
                 )
             }
-            withAnimation(animation) {
+            mutateQueue(animation) {
                 self.mainQueue.append(identifiableView)
             }
         case .temporary:
@@ -280,23 +280,42 @@ extension ContainerQueueHandler {
     }
 
     /// Remove a identifiable view from specific queue
-    func remove(view id: UUID, from queue: QueueType, animation: Animation) {
+    ///
+    /// A nil animation means the change must not be animated at all.
+    func remove(view id: UUID, from queue: QueueType, animation: Animation?) {
         switch queue {
         case .main:
             if let index = mainQueue.firstIndex(where: { $0.id == id }) {
-                withAnimation(animation) {
+                mutateQueue(animation) {
                     // swiftlint:disable:next redundant_discardable_let
                     _ = self.mainQueue.remove(at: index)
                 }
             }
         case .temporary:
             if let index = tempQueue.firstIndex(where: { $0.id == id }) {
-                withAnimation(animation) {
+                mutateQueue(animation) {
                     // swiftlint:disable:next redundant_discardable_let
                     _ = self.tempQueue.remove(at: index)
                 }
             }
         }
+    }
+
+    /// Apply a queue change, genuinely disabling animation when none was requested.
+    ///
+    /// `withAnimation(.easeIn(duration: 0))` still opens an animated transaction, which makes a
+    /// removal transition driven: the view stays mounted until a frame completes the transition.
+    /// A container hosted in a secondary window whose render loop is idle can therefore keep
+    /// rendering a view whose queue entry is already gone, and its `onDisappear` never runs. A
+    /// transaction with `disablesAnimations` removes the view in place instead.
+    func mutateQueue(_ animation: Animation?, _ change: () -> Void) {
+        guard let animation = animation else {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction, change)
+            return
+        }
+        withAnimation(animation, change)
     }
 }
 
