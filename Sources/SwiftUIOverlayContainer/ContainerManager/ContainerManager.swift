@@ -20,6 +20,29 @@ struct PreservedContainerQueueState {
     var isEmpty: Bool {
         mainQueue.isEmpty && tempQueue.isEmpty
     }
+
+    /// Drop a single view from both queues, for a view dismissed while its container is disconnected.
+    func removingView(id: UUID) -> PreservedContainerQueueState {
+        PreservedContainerQueueState(
+            mainQueue: mainQueue.filter { $0.id != id },
+            tempQueue: tempQueue.filter { $0.id != id }
+        )
+    }
+
+    /// Drop the displayed queue only, for a `dismissShowing` received while disconnected.
+    var removingMainQueue: PreservedContainerQueueState {
+        PreservedContainerQueueState(mainQueue: [], tempQueue: tempQueue)
+    }
+}
+
+/// A weak handle on a container's queue handler.
+///
+/// `publishers` is torn down every time a container disappears, but the handler owns the queues and
+/// stays alive for as long as its container view does. Holding a weak handle lets a dismiss reach a
+/// container that is not currently registered, instead of being dropped on the floor and leaving a
+/// view on screen that nothing can take off.
+struct WeakQueueHandler {
+    weak var handler: ContainerQueueHandler?
 }
 
 /// The manager of all overlay containers that provides a bridge between containers and SwiftUI views.
@@ -41,6 +64,7 @@ struct PreservedContainerQueueState {
 public final class ContainerManager: ContainerManagerLogger {
     var publishers: [String: ContainerViewPublisher] = [:]
     var preservedQueueStates: [String: PreservedContainerQueueState] = [:]
+    var queueHandlers: [String: [WeakQueueHandler]] = [:]
 
     public init(logger: SwiftUIOverlayContainerLoggerProtocol? = nil, debugLevel: Int = 0) {
         if logger == nil {
@@ -75,6 +99,117 @@ public final class ContainerManager: ContainerManagerLogger {
 
     func removePreservedQueueState(for container: String) {
         preservedQueueStates.removeValue(forKey: container)
+    }
+
+    /// Keep a weak handle on a container's queue handler. Called by the container when it connects.
+    func registerQueueHandler(_ handler: ContainerQueueHandler, for container: String) {
+        var handles = queueHandlers[container, default: []].filter { $0.handler != nil }
+        if !handles.contains(where: { $0.handler === handler }) {
+            handles.append(WeakQueueHandler(handler: handler))
+        }
+        queueHandlers[container] = handles
+    }
+
+    /// The still-allocated handlers of a container, pruning the handles that have gone.
+    func liveQueueHandlers(for container: String) -> [ContainerQueueHandler] {
+        guard let handles = queueHandlers[container] else { return [] }
+        let alive = handles.filter { $0.handler != nil }
+        if alive.isEmpty {
+            queueHandlers.removeValue(forKey: container)
+        } else if alive.count != handles.count {
+            queueHandlers[container] = alive
+        }
+        return alive.compactMap { $0.handler }
+    }
+
+    /// Every container name the manager knows anything about, including the ones that are torn down
+    /// but still hold a preserved queue or a live handler.
+    ///
+    /// Read on the caller's thread, like `publishers` itself, so that a dismiss decides which
+    /// containers it covers at the moment it is issued.
+    var knownContainers: Set<String> {
+        Set(publishers.keys).union(queueHandlers.keys).union(preservedQueueStates.keys)
+    }
+
+    /// What a dismiss request covers, so the same request can be applied to a preserved queue and
+    /// to a handler the publisher could not reach.
+    enum DismissScope {
+        case view(UUID)
+        case all
+        case showing
+        case topmost
+    }
+
+    /// Complete a dismiss for the parts of a container the publisher cannot reach: the queue state
+    /// preserved for a container that is currently torn down, and any live handler that is not
+    /// subscribed.
+    ///
+    /// Whether the container was registered is sampled now rather than when the hop runs. A
+    /// container that reconnects in between would otherwise look connected and be skipped, even
+    /// though nothing was ever sent to it. When it was registered the subscribed handlers already
+    /// received the action through the publisher and only the unsubscribed ones are covered here;
+    /// when it was not, nothing was sent at all, so every live handler is. Each handler is reached
+    /// exactly once either way, which is what a non-idempotent action such as `dismissTopmostView`
+    /// requires.
+    ///
+    /// Everything touching `queueHandlers` and `preservedQueueStates` runs inside the hop, so both
+    /// are only ever mutated on the main queue, matching `connect` and `disconnect`.
+    func completeDismiss(_ scope: DismissScope, in container: String, animated flag: Bool) {
+        completeDismiss(scope, in: container, animated: flag, wasRegistered: publishers[container] != nil)
+    }
+
+    func completeDismiss(_ scope: DismissScope, in container: String, animated flag: Bool, wasRegistered: Bool) {
+        DispatchQueue.main.async { @MainActor [weak self] in
+            guard let self = self else { return }
+
+            // `.topmost` names a view only once a handler is in hand, so it is discarded per view
+            // below instead of here.
+            if case .topmost = scope {} else {
+                self.discardPreserved(scope, for: container)
+            }
+
+            let unreached = self.liveQueueHandlers(for: container)
+                .filter { !wasRegistered || $0.cancellable == nil }
+            guard !unreached.isEmpty else { return }
+
+            self.sendMessage(
+                type: .info,
+                message: "dismiss delivered directly to \(unreached.count) unreached handler(s) of `\(container)`",
+                debugLevel: 2
+            )
+
+            for handler in unreached {
+                switch scope {
+                case let .view(id):
+                    handler.dismiss(id: id, animated: flag)
+                case .all:
+                    handler.dismissAll(animated: flag)
+                case .showing:
+                    handler.dismissMainQueue(animated: flag)
+                case .topmost:
+                    // Resolving the id here keeps the removal and the discard in agreement, so a
+                    // reconnecting container cannot restore the view that was just dismissed.
+                    guard let id = handler.topmostViewID else { continue }
+                    handler.dismiss(id: id, animated: flag)
+                    self.discardPreserved(.view(id), for: container)
+                }
+            }
+        }
+    }
+
+    /// Drop the preserved views a dismiss covers, so a reconnecting container cannot resume them.
+    private func discardPreserved(_ scope: DismissScope, for container: String) {
+        guard let state = preservedQueueStates[container] else { return }
+        switch scope {
+        case let .view(id):
+            preserveQueueState(state.removingView(id: id), for: container)
+        case .all:
+            preservedQueueStates.removeValue(forKey: container)
+        case .showing:
+            preserveQueueState(state.removingMainQueue, for: container)
+        case .topmost:
+            break
+        }
     }
 }
 
@@ -205,10 +340,10 @@ extension ContainerManager: ContainerViewManagementForEnvironment {
     ///   - container: The container to which the view has been pushed
     ///   - flag: Pass false, no animation when dismiss the view
     public func dismiss(view id: UUID, in container: String, animated flag: Bool) {
-        guard let publisher = getPublisher(for: container) else {
-            return
+        if let publisher = publishers[container] {
+            publisher.upstream.send(.dismiss(id, flag))
         }
-        publisher.upstream.send(.dismiss(id, flag))
+        completeDismiss(.view(id), in: container, animated: flag)
     }
 
     /// Dismiss all views of all containers that has registered exclude  containers in the excludeContainers list.
@@ -217,13 +352,25 @@ extension ContainerManager: ContainerViewManagementForEnvironment {
     ///   - onlyShowing: Only dismiss the view that is be displaying (in mainQueue). Applies only to oneByOneWaitFinish mode. after dismiss, the view in the tempQueue will be displayed.
     ///   - flag: Pass false, no animation when dismiss the view
     public func dismissAllView(notInclude excludeContainers: [String], onlyShowing: Bool = false, animated flag: Bool) {
-        let publishers = publishers.filter { !excludeContainers.contains($0.key) }.values
-        for publisher in publishers {
-            if onlyShowing {
-                publisher.upstream.send(.dismissShowing(flag))
-            } else {
-                publisher.upstream.send(.dismissAll(flag))
-            }
+        let scope: DismissScope = onlyShowing ? .showing : .all
+
+        // Registered containers are still reached synchronously, exactly as before. Deferring the
+        // send would let a `show` issued right after this call be delivered ahead of the dismiss
+        // that precedes it, and destroy the view that was just presented.
+        let registered = publishers.filter { !excludeContainers.contains($0.key) }
+        for (container, publisher) in registered {
+            publisher.upstream.send(onlyShowing ? .dismissShowing(flag) : .dismissAll(flag))
+            completeDismiss(scope, in: container, animated: flag, wasRegistered: true)
+        }
+
+        // The containers that are torn down are sampled now rather than when the hop runs, so a
+        // container that appears after this call is not dismissed by a request that predates it.
+        // Nothing was sent to them, so `wasRegistered: false` holds even if one reconnects first.
+        let torndown = knownContainers
+            .subtracting(excludeContainers)
+            .subtracting(registered.keys)
+        for container in torndown {
+            completeDismiss(scope, in: container, animated: flag, wasRegistered: false)
         }
     }
 
@@ -234,13 +381,14 @@ extension ContainerManager: ContainerViewManagementForEnvironment {
     ///   - flag: Pass false, no animation when dismiss the view
     public func dismissAllView(in containers: [String], onlyShowing: Bool = false, animated flag: Bool) {
         for container in containers {
-            if let publisher = getPublisher(for: container) {
+            if let publisher = publishers[container] {
                 if onlyShowing {
                     publisher.upstream.send(.dismissShowing(flag))
                 } else {
                     publisher.upstream.send(.dismissAll(flag))
                 }
             }
+            completeDismiss(onlyShowing ? .showing : .all, in: container, animated: flag)
         }
     }
 
@@ -250,9 +398,10 @@ extension ContainerManager: ContainerViewManagementForEnvironment {
     ///   - flag: Pass false, disable animation when dismiss the view
     public func dismissTopmostView(in containers: [String], animated flag: Bool) {
         for container in containers {
-            if let publisher = getPublisher(for: container) {
+            if let publisher = publishers[container] {
                 publisher.upstream.send(.dismissTopmostView(flag))
             }
+            completeDismiss(.topmost, in: container, animated: flag)
         }
     }
 }

@@ -131,6 +131,9 @@ final class ContainerQueueHandler: ObservableObject {
                 guard let queueType = self?.queueType else { return }
                 self?.getStrategyHandler(for: queueType)(action)
             }
+        // Stay reachable by the manager even after `disconnect` removes the publisher, so a dismiss
+        // sent while this container is unregistered is applied instead of being dropped.
+        manager.registerQueueHandler(self, for: container)
         restorePreservedQueueStateIfNeeded()
         sendMessage(type: .info, message: "container `\(container)` connected", debugLevel: 2)
     }
@@ -213,16 +216,19 @@ extension ContainerQueueHandler {
         }
     }
 
-    /// Dismiss the topmost view ( with the largest zIndex , not the top one of main queue )
-    func dismissTopmostView(animated flag: Bool) {
-        let theTopViewID: UUID?
+    /// The topmost view ( with the largest zIndex , not the top one of main queue )
+    var topmostViewID: UUID? {
         switch displayOrder {
         case .ascending:
-            theTopViewID = mainQueue.sorted(by: { $0.timeStamp > $1.timeStamp }).first?.id
+            return mainQueue.sorted(by: { $0.timeStamp > $1.timeStamp }).first?.id
         case .descending:
-            theTopViewID = mainQueue.sorted(by: { $0.timeStamp < $1.timeStamp }).first?.id
+            return mainQueue.sorted(by: { $0.timeStamp < $1.timeStamp }).first?.id
         }
-        if let id = theTopViewID {
+    }
+
+    /// Dismiss the topmost view ( with the largest zIndex , not the top one of main queue )
+    func dismissTopmostView(animated flag: Bool) {
+        if let id = topmostViewID {
             dismiss(id: id, animated: flag)
         }
     }
