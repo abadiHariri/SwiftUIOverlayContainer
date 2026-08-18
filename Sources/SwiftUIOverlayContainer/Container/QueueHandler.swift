@@ -95,11 +95,6 @@ final class ContainerQueueHandler: ObservableObject {
         self.queueControlOperator = queueControlOperator
     }
 
-    /// Short stable identity for logs, so several handlers of one container name can be told apart.
-    var handlerTag: String {
-        String(UInt(bitPattern: ObjectIdentifier(self).hashValue) % 10000)
-    }
-
     /// The publisher this handler is subscribed to; nil when disconnected.
     ///
     /// `checkForExist` replaces a container's publisher whenever a same-name container registers,
@@ -126,7 +121,7 @@ final class ContainerQueueHandler: ObservableObject {
         if !preservingQueue {
             dismissAll(animated: false)
         }
-        sendMessage(type: .info, message: "handler \(handlerTag) of container `\(container)` DISCONNECTED (preserving: \(preservingQueue), main count \(mainQueue.count))", debugLevel: 2)
+        sendMessage(type: .info, message: "container `\(container)` disconnected", debugLevel: 2)
     }
 
     /// Register the container in the container manager. This method will be called when  the container appear ( not in container view init ).
@@ -153,7 +148,7 @@ final class ContainerQueueHandler: ObservableObject {
         // sent while this container is unregistered is applied instead of being dropped.
         manager.registerQueueHandler(self, for: container)
         restorePreservedQueueStateIfNeeded()
-        sendMessage(type: .info, message: "handler \(handlerTag) of container `\(container)` CONNECTED (main count \(mainQueue.count))", debugLevel: 2)
+        sendMessage(type: .info, message: "container `\(container)` connected", debugLevel: 2)
     }
 
     /// Send message with debug level to container manager logger
@@ -192,18 +187,8 @@ extension ContainerQueueHandler {
     func dismiss(id: UUID, animated flag: Bool) {
         // get identifiableView
         guard let (identifiableView, queue) = getIdentifiableView(id: id) else {
-            sendMessage(
-                type: .error,
-                message: "handler \(handlerTag) of `\(container)` was asked to dismiss \(id) but does not hold it (main: \(mainQueue.map(\.id)), temp: \(tempQueue.map(\.id)))",
-                debugLevel: 2
-            )
             return
         }
-        sendMessage(
-            type: .info,
-            message: "handler \(handlerTag) of `\(container)` removing \(id) from \(queue) (main count \(mainQueue.count))",
-            debugLevel: 2
-        )
 
         // setup animation
         var animation = Animation.disable
@@ -267,11 +252,6 @@ extension ContainerQueueHandler {
         identifiableView.timeStamp = Date()
         switch queue {
         case .main:
-            sendMessage(
-                type: .info,
-                message: "handler \(handlerTag) of `\(container)` PUSHING \(identifiableView.id) into main (count before \(mainQueue.count))",
-                debugLevel: 2
-            )
             var animation: Animation = .disable
             if flag {
                 animation = Animation.merge(
